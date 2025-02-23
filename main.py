@@ -3,19 +3,20 @@ import os
 import json
 from datetime import datetime
 from typing import Optional
+from transformers import PreTrainedModel, AutoModelForCausalLM, AutoTokenizer
 
 # Third-Party Imports
 import numpy as np
 import pandas as pd
 import xgboost as xgb
 import torch
+from peft import PeftModel
 import uvicorn
 from fastapi import FastAPI, HTTPException, Header,  Response, Request
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
 from huggingface_hub import login
-from transformers import GPT2LMHeadModel, GPT2Tokenizer
 from dotenv import load_dotenv
 from bson import ObjectId
 
@@ -41,10 +42,11 @@ def jsonable_encoder_custom(obj):
         return [jsonable_encoder_custom(i) for i in obj]
     return obj
 
-
 # Initialize FastAPI app
 app = FastAPI(
     title="Mental Health Prediction API",
+    description="API for mental health prediction and therapy chatbot",
+    version="1.0.0",
     json_encoder=JSONEncoder
 )
 
@@ -80,91 +82,85 @@ class ChatResponse(BaseModel):
     response: str
     timestamp: datetime = Field(default_factory=datetime.utcnow)
 
-# Chatbot class
 class TherapyChatbot:
     def __init__(self):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model_name = "ezahpizza/mindease_chatbot"
+        self.base_model_name = "microsoft/phi-2"
+        self.peft_model_name = "ezahpizza/mindease-phi"
+        self.hf_token = "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"
+        self.torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
         self.tokenizer = None
         self.model = None
-        self.hf_token = HF_TOKEN
-        
+
     async def load_model(self):
         if self.model is None:
             try:
-                if not self.hf_token:
-                    raise ValueError("HUGGINGFACE_TOKEN not found in environment variables")
-                
-                self.tokenizer = GPT2Tokenizer.from_pretrained(
-                    self.model_name,
-                    token=self.hf_token,
-                    revision="main"
+                print(f"Loading model on device: {self.device}")
+                # Load base model
+                base_model = AutoModelForCausalLM.from_pretrained(
+                    self.base_model_name,
+                    torch_dtype=self.torch_dtype,
+                    token=self.hf_token
+                ).to(self.device)  # Move base model to device
+
+                # Load PEFT adapted model
+                self.model = PeftModel.from_pretrained(
+                    base_model,
+                    self.peft_model_name,
+                    token=self.hf_token
+                ).to(self.device)  # Move PEFT model to device
+
+                # Load and configure tokenizer
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    self.peft_model_name,
+                    token=self.hf_token
                 )
-                
-                self.model = GPT2LMHeadModel.from_pretrained(
-                    self.model_name,
-                    token=self.hf_token,
-                    revision="main"
-                )
-                
-                special_tokens = {
-                    'additional_special_tokens': ['<|context|>', '<|response|>']
-                }
-                self.tokenizer.add_special_tokens(special_tokens)
-                self.model.resize_token_embeddings(len(self.tokenizer))
-                
                 self.tokenizer.pad_token = self.tokenizer.eos_token
-                self.model.config.pad_token_id = self.tokenizer.pad_token_id
-                
-                self.model.to(self.device)
-                self.model.eval()
-                
+                print("Model loaded successfully!")
+
             except Exception as e:
                 print(f"Error loading model: {str(e)}")
                 raise
-    
+
     async def generate_response(self, message: str) -> str:
         await self.load_model()
-        
-        input_text = f"<|context|>{message}<|response|>"
-        
-        try:
-            encoded = self.tokenizer(
-                input_text,
-                return_tensors='pt',
-                padding=True,
-                truncation=True,
-                max_length=200,
-                return_attention_mask=True
-            )
 
-            input_ids = encoded['input_ids'].to(self.device)
-            attention_mask = encoded['attention_mask'].to(self.device)
+        input_text = f"<|context|>{message}<|response|>"
+
+        try:
+            # Create inputs and move to the same device as model
+            inputs = self.tokenizer(
+                input_text,
+                return_tensors="pt"
+            )
+            # Move input tensors to the same device as the model
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
             with torch.no_grad():
                 output_ids = self.model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    max_length=200,
-                    num_return_sequences=1,
-                    pad_token_id=self.tokenizer.pad_token_id,
+                    **inputs,
+                    max_length=100,
+                    num_beams=5,
                     do_sample=True,
+                    no_repeat_ngram_size=3,
+                    repetition_penalty=1.2,
                     temperature=0.7,
                     top_p=0.9,
-                    no_repeat_ngram_size=2,
-                    eos_token_id=self.tokenizer.eos_token_id,
+                    top_k=50
                 )
 
-            generated_text = self.tokenizer.decode(output_ids[0], skip_special_tokens=False)
+            generated_text = self.tokenizer.decode(
+                output_ids[0],
+                skip_special_tokens=True
+            )
+
             response = generated_text.split("<|response|>")[-1].strip()
-            response = response.replace(self.tokenizer.eos_token, "").strip()
-            
-            return response.replace(self.tokenizer.eos_token, "").strip()
-            
+            return response
+
         except Exception as e:
             print(f"Error generating response: {str(e)}")
             return "I apologize, but I'm having trouble generating a response right now."
-
+        
 # Initialize chatbot instance
 chatbot = TherapyChatbot()
 
@@ -304,9 +300,7 @@ async def chat(chat_input: ChatMessage):
         ])
         
         return ChatResponse(response=response)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-        
+    
     except Exception as e:
         print(f"Detailed error in chat endpoint: {str(e)}")
         raise HTTPException(
