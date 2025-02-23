@@ -87,7 +87,7 @@ class TherapyChatbot:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.base_model_name = "microsoft/phi-2"
         self.peft_model_name = "ezahpizza/mindease-phi"
-        self.hf_token = os.getenv("HF_TOKEN")
+        self.hf_token = HF_TOKEN
         self.torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
         self.tokenizer = None
         self.model = None
