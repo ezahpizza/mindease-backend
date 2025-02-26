@@ -46,7 +46,7 @@ def jsonable_encoder_custom(obj):
 app = FastAPI(
     title="Mental Health Prediction API",
     description="API for mental health prediction and therapy chatbot",
-    version="1.0.0",
+    version="1.2.0",
     json_encoder=JSONEncoder
 )
 
